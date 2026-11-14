@@ -95,6 +95,10 @@ type Transaction struct {
 	// Handles request body buffers
 	requestBodyBuffer *BodyBuffer
 
+	// Handles the decompressed request body when the request carries a gzip
+	// or deflate Content-Encoding. Nil when the body was not encoded.
+	decodedRequestBodyBuffer *BodyBuffer
+
 	// Handles response body buffers
 	responseBodyBuffer *BodyBuffer
 
@@ -1139,6 +1143,44 @@ func (tx *Transaction) ProcessRequestBody() (*types.Interruption, error) {
 		return nil, err
 	}
 
+	// A body sent with a Content-Encoding (e.g. gzip) would otherwise reach
+	// the body processor as opaque compressed bytes that rules cannot match,
+	// so it is decompressed before inspection. Multipart bodies are inspected
+	// as received.
+	switch encoding := tx.requestContentEncoding(); encoding {
+	case "", "identity":
+	case "gzip", "deflate":
+		if !isMultipartMimeType(mimeType) {
+			var partial bool
+			reader, partial, err = tx.decompressRequestBody(reader, encoding)
+			if err != nil {
+				return nil, err
+			}
+			if partial {
+				// The body could not be decompressed completely, either
+				// because the compressed data is corrupt or because the
+				// decompressed size reached SecRequestBodyLimit: handle it
+				// like any other body exceeding the limit.
+				tx.variables.inboundDataError.Set("1")
+				if tx.WAF.RequestBodyLimitAction == types.BodyLimitActionReject {
+					it, _, err := setAndReturnBodyLimitInterruption(tx, 413)
+					return it, err
+				}
+			}
+		}
+	default:
+		// The body cannot be inspected because its Content-Encoding is not
+		// supported: reject the transaction explicitly.
+		tx.debugLogger.Warn().
+			Str("content_encoding", encoding).
+			Msg("Rejecting request with unsupported Content-Encoding")
+		tx.interruption = &types.Interruption{
+			Status: 415,
+			Action: "deny",
+		}
+		return tx.interruption, nil
+	}
+
 	rbp := tx.variables.reqbodyProcessor.Get()
 
 	// Default variables.ReqbodyProcessor values
@@ -1749,6 +1791,12 @@ func (tx *Transaction) Close() error {
 	}
 	if err := tx.requestBodyBuffer.Reset(); err != nil {
 		errs = append(errs, fmt.Errorf("reseting request body buffer: %v", err))
+	}
+	if tx.decodedRequestBodyBuffer != nil {
+		if err := tx.decodedRequestBodyBuffer.Reset(); err != nil {
+			errs = append(errs, fmt.Errorf("reseting decoded request body buffer: %v", err))
+		}
+		tx.decodedRequestBodyBuffer = nil
 	}
 	if err := tx.responseBodyBuffer.Reset(); err != nil {
 		errs = append(errs, fmt.Errorf("reseting response body buffer: %v", err))
